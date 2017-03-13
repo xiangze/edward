@@ -2,6 +2,11 @@
 """Convolutional variational auto-encoder for binarized MNIST.
 
 The neural networks are written with TensorFlow Slim.
+
+References
+----------
+http://edwardlib.org/tutorials/decoder
+http://edwardlib.org/tutorials/inference-networks
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -77,7 +82,7 @@ mnist = input_data.read_data_sets(DATA_DIR, one_hot=True)
 
 # MODEL
 z = Normal(mu=tf.zeros([M, d]), sigma=tf.ones([M, d]))
-logits = generative_network(z.value())
+logits = generative_network(z)
 x = Bernoulli(logits=logits)
 
 # INFERENCE

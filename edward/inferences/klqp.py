@@ -4,11 +4,11 @@ from __future__ import print_function
 
 import six
 import tensorflow as tf
-import warnings
 
 from edward.inferences.variational_inference import VariationalInference
 from edward.models import RandomVariable, Normal
-from edward.util import copy, kl_multivariate_normal
+from edward.util import copy
+from tensorflow.contrib import distributions as ds
 
 
 class KLqp(VariationalInference):
@@ -92,8 +92,8 @@ class KLqp(VariationalInference):
 
     of the loss function.
 
-    If the variational model is a normal distribution and the prior is
-    standard normal, then loss function can be written as
+    If the KL divergence between the variational model and the prior
+    is tractable, then the loss function can be written as
 
     .. math::
 
@@ -101,16 +101,13 @@ class KLqp(VariationalInference):
         \\text{KL}( q(z; \lambda) \| p(z) ),
 
     where the KL term is computed analytically (Kingma and Welling,
-    2014).
+    2014). We compute this automatically when :math:`p(z)` and
+    :math:`q(z; \lambda)` are Normal.
     """
     is_reparameterizable = all([rv.is_reparameterized and rv.is_continuous
                                 for rv in six.itervalues(self.latent_vars)])
-    qz_is_normal = all([isinstance(rv, Normal) for
-                       rv in six.itervalues(self.latent_vars)])
-    z_is_normal = all([isinstance(rv, Normal) for
-                       rv in six.iterkeys(self.latent_vars)])
-    is_analytic_kl = qz_is_normal and \
-        (z_is_normal or hasattr(self.model_wrapper, 'log_lik'))
+    is_analytic_kl = all([isinstance(z, Normal) and isinstance(qz, Normal)
+                          for z, qz in six.iteritems(self.latent_vars)])
     if is_reparameterizable:
       if is_analytic_kl:
         return build_reparam_kl_loss_and_gradients(self, var_list)
@@ -127,12 +124,6 @@ class KLqp(VariationalInference):
       #    return build_score_entropy_loss_and_gradients(self, var_list)
       else:
         return build_score_loss_and_gradients(self, var_list)
-
-
-def MFVI(*args, **kwargs):
-  warnings.simplefilter('default', DeprecationWarning)
-  warnings.warn("MFVI is deprecated; use KLqp instead.", DeprecationWarning)
-  return KLqp(*args, **kwargs)
 
 
 class ReparameterizationKLqp(VariationalInference):
@@ -351,47 +342,39 @@ def build_reparam_loss_and_gradients(inference, var_list):
   p_log_prob = [0.0] * inference.n_samples
   q_log_prob = [0.0] * inference.n_samples
   for s in range(inference.n_samples):
+    # Form dictionary in order to replace conditioning on prior or
+    # observed variable with conditioning on a specific value.
     scope = 'inference_' + str(id(inference)) + '/' + str(s)
-    z_sample = {}
+    dict_swap = {}
+    for x, qx in six.iteritems(inference.data):
+      if isinstance(x, RandomVariable):
+        if isinstance(qx, RandomVariable):
+          qx_copy = copy(qx, scope=scope)
+          dict_swap[x] = qx_copy.value()
+        else:
+          dict_swap[x] = qx
+
     for z, qz in six.iteritems(inference.latent_vars):
       # Copy q(z) to obtain new set of posterior samples.
       qz_copy = copy(qz, scope=scope)
-      z_sample[z] = qz_copy.value()
+      dict_swap[z] = qz_copy.value()
       q_log_prob[s] += tf.reduce_sum(
-          inference.scale.get(z, 1.0) * qz_copy.log_prob(z_sample[z]))
+          inference.scale.get(z, 1.0) * qz_copy.log_prob(dict_swap[z]))
 
-    if inference.model_wrapper is None:
-      # Form dictionary in order to replace conditioning on prior or
-      # observed variable with conditioning on a specific value.
-      dict_swap = z_sample
-      for x, qx in six.iteritems(inference.data):
-        if isinstance(x, RandomVariable):
-          if isinstance(qx, RandomVariable):
-            qx_copy = copy(qx, scope=scope)
-            dict_swap[x] = qx_copy.value()
-          else:
-            dict_swap[x] = qx
+    for z in six.iterkeys(inference.latent_vars):
+      z_copy = copy(z, dict_swap, scope=scope)
+      p_log_prob[s] += tf.reduce_sum(
+          inference.scale.get(z, 1.0) * z_copy.log_prob(dict_swap[z]))
 
-      for z in six.iterkeys(inference.latent_vars):
-        z_copy = copy(z, dict_swap, scope=scope)
+    for x in six.iterkeys(inference.data):
+      if isinstance(x, RandomVariable):
+        x_copy = copy(x, dict_swap, scope=scope)
         p_log_prob[s] += tf.reduce_sum(
-            inference.scale.get(z, 1.0) * z_copy.log_prob(dict_swap[z]))
-
-      for x in six.iterkeys(inference.data):
-        if isinstance(x, RandomVariable):
-          x_copy = copy(x, dict_swap, scope=scope)
-          p_log_prob[s] += tf.reduce_sum(
-              inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
-    else:
-      x = inference.data
-      p_log_prob[s] = inference.model_wrapper.log_prob(x, z_sample)
+            inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
 
   p_log_prob = tf.stack(p_log_prob)
   q_log_prob = tf.stack(q_log_prob)
   loss = -tf.reduce_mean(p_log_prob - q_log_prob)
-
-  if var_list is None:
-    var_list = tf.trainable_variables()
 
   grads = tf.gradients(loss, [v._ref() for v in var_list])
   grads_and_vars = list(zip(grads, var_list))
@@ -411,57 +394,41 @@ def build_reparam_kl_loss_and_gradients(inference, var_list):
 
   It assumes the KL is analytic.
 
-  For model wrappers, it assumes the prior is :math:`p(z) =
-  \mathcal{N}(z; 0, 1)`.
-
   Computed by sampling from :math:`q(z;\lambda)` and evaluating the
   expectation using Monte Carlo sampling.
   """
   p_log_lik = [0.0] * inference.n_samples
   for s in range(inference.n_samples):
+    # Form dictionary in order to replace conditioning on prior or
+    # observed variable with conditioning on a specific value.
     scope = 'inference_' + str(id(inference)) + '/' + str(s)
-    z_sample = {}
+    dict_swap = {}
+    for x, qx in six.iteritems(inference.data):
+      if isinstance(x, RandomVariable):
+        if isinstance(qx, RandomVariable):
+          qx_copy = copy(qx, scope=scope)
+          dict_swap[x] = qx_copy.value()
+        else:
+          dict_swap[x] = qx
+
     for z, qz in six.iteritems(inference.latent_vars):
       # Copy q(z) to obtain new set of posterior samples.
       qz_copy = copy(qz, scope=scope)
-      z_sample[z] = qz_copy.value()
+      dict_swap[z] = qz_copy.value()
 
-    if inference.model_wrapper is None:
-      # Form dictionary in order to replace conditioning on prior or
-      # observed variable with conditioning on a specific value.
-      dict_swap = z_sample
-      for x, qx in six.iteritems(inference.data):
-        if isinstance(x, RandomVariable):
-          if isinstance(qx, RandomVariable):
-            qx_copy = copy(qx, scope=scope)
-            dict_swap[x] = qx_copy.value()
-          else:
-            dict_swap[x] = qx
-
-      for x in six.iterkeys(inference.data):
-        if isinstance(x, RandomVariable):
-          x_copy = copy(x, dict_swap, scope=scope)
-          p_log_lik[s] += tf.reduce_sum(
-              inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
-    else:
-      x = inference.data
-      p_log_lik[s] = inference.model_wrapper.log_lik(x, z_sample)
+    for x in six.iterkeys(inference.data):
+      if isinstance(x, RandomVariable):
+        x_copy = copy(x, dict_swap, scope=scope)
+        p_log_lik[s] += tf.reduce_sum(
+            inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
 
   p_log_lik = tf.stack(p_log_lik)
 
-  if inference.model_wrapper is None:
-    kl = tf.reduce_sum([
-        inference.kl_scaling.get(z, 1.0) * tf.reduce_sum(
-            kl_multivariate_normal(qz.mu, qz.sigma, z.mu, z.sigma))
-        for z, qz in six.iteritems(inference.latent_vars)])
-  else:
-    kl = tf.reduce_sum([tf.reduce_sum(kl_multivariate_normal(qz.mu, qz.sigma))
-                        for qz in six.itervalues(inference.latent_vars)])
+  kl = tf.reduce_sum([
+      inference.kl_scaling.get(z, 1.0) * tf.reduce_sum(ds.kl(qz, z))
+      for z, qz in six.iteritems(inference.latent_vars)])
 
   loss = -(tf.reduce_mean(p_log_lik) - kl)
-
-  if var_list is None:
-    var_list = tf.trainable_variables()
 
   grads = tf.gradients(loss, [v._ref() for v in var_list])
   grads_and_vars = list(zip(grads, var_list))
@@ -486,48 +453,40 @@ def build_reparam_entropy_loss_and_gradients(inference, var_list):
   """
   p_log_prob = [0.0] * inference.n_samples
   for s in range(inference.n_samples):
+    # Form dictionary in order to replace conditioning on prior or
+    # observed variable with conditioning on a specific value.
     scope = 'inference_' + str(id(inference)) + '/' + str(s)
-    z_sample = {}
+    dict_swap = {}
+    for x, qx in six.iteritems(inference.data):
+      if isinstance(x, RandomVariable):
+        if isinstance(qx, RandomVariable):
+          qx_copy = copy(qx, scope=scope)
+          dict_swap[x] = qx_copy.value()
+        else:
+          dict_swap[x] = qx
+
     for z, qz in six.iteritems(inference.latent_vars):
       # Copy q(z) to obtain new set of posterior samples.
       qz_copy = copy(qz, scope=scope)
-      z_sample[z] = qz_copy.value()
+      dict_swap[z] = qz_copy.value()
 
-    if inference.model_wrapper is None:
-      # Form dictionary in order to replace conditioning on prior or
-      # observed variable with conditioning on a specific value.
-      dict_swap = z_sample
-      for x, qx in six.iteritems(inference.data):
-        if isinstance(x, RandomVariable):
-          if isinstance(qx, RandomVariable):
-            qx_copy = copy(qx, scope=scope)
-            dict_swap[x] = qx_copy.value()
-          else:
-            dict_swap[x] = qx
+    for z in six.iterkeys(inference.latent_vars):
+      z_copy = copy(z, dict_swap, scope=scope)
+      p_log_prob[s] += tf.reduce_sum(
+          inference.scale.get(z, 1.0) * z_copy.log_prob(dict_swap[z]))
 
-      for z in six.iterkeys(inference.latent_vars):
-        z_copy = copy(z, dict_swap, scope=scope)
+    for x in six.iterkeys(inference.data):
+      if isinstance(x, RandomVariable):
+        x_copy = copy(x, dict_swap, scope=scope)
         p_log_prob[s] += tf.reduce_sum(
-            inference.scale.get(z, 1.0) * z_copy.log_prob(dict_swap[z]))
-
-      for x in six.iterkeys(inference.data):
-        if isinstance(x, RandomVariable):
-          x_copy = copy(x, dict_swap, scope=scope)
-          p_log_prob[s] += tf.reduce_sum(
-              inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
-    else:
-      x = inference.data
-      p_log_prob[s] = inference.model_wrapper.log_prob(x, z_sample)
+            inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
 
   p_log_prob = tf.stack(p_log_prob)
 
-  q_entropy = tf.reduce_sum([inference.data.get(z, 1.0) * qz.entropy()
-                             for z, qz in six.iteritems(inference.latent_vars)])
+  q_entropy = tf.reduce_sum([
+      qz.entropy() for z, qz in six.iteritems(inference.latent_vars)])
 
   loss = -(tf.reduce_mean(p_log_prob) + q_entropy)
-
-  if var_list is None:
-    var_list = tf.trainable_variables()
 
   grads = tf.gradients(loss, [v._ref() for v in var_list])
   grads_and_vars = list(zip(grads, var_list))
@@ -544,47 +503,39 @@ def build_score_loss_and_gradients(inference, var_list):
   p_log_prob = [0.0] * inference.n_samples
   q_log_prob = [0.0] * inference.n_samples
   for s in range(inference.n_samples):
+    # Form dictionary in order to replace conditioning on prior or
+    # observed variable with conditioning on a specific value.
     scope = 'inference_' + str(id(inference)) + '/' + str(s)
-    z_sample = {}
+    dict_swap = {}
+    for x, qx in six.iteritems(inference.data):
+      if isinstance(x, RandomVariable):
+        if isinstance(qx, RandomVariable):
+          qx_copy = copy(qx, scope=scope)
+          dict_swap[x] = qx_copy.value()
+        else:
+          dict_swap[x] = qx
+
     for z, qz in six.iteritems(inference.latent_vars):
       # Copy q(z) to obtain new set of posterior samples.
       qz_copy = copy(qz, scope=scope)
-      z_sample[z] = qz_copy.value()
+      dict_swap[z] = qz_copy.value()
       q_log_prob[s] += tf.reduce_sum(
           inference.scale.get(z, 1.0) *
-          qz_copy.log_prob(tf.stop_gradient(z_sample[z])))
+          qz_copy.log_prob(tf.stop_gradient(dict_swap[z])))
 
-    if inference.model_wrapper is None:
-      # Form dictionary in order to replace conditioning on prior or
-      # observed variable with conditioning on a specific value.
-      dict_swap = z_sample
-      for x, qx in six.iteritems(inference.data):
-        if isinstance(x, RandomVariable):
-          if isinstance(qx, RandomVariable):
-            qx_copy = copy(qx, scope=scope)
-            dict_swap[x] = qx_copy.value()
-          else:
-            dict_swap[x] = qx
+    for z in six.iterkeys(inference.latent_vars):
+      z_copy = copy(z, dict_swap, scope=scope)
+      p_log_prob[s] += tf.reduce_sum(
+          inference.scale.get(z, 1.0) * z_copy.log_prob(dict_swap[z]))
 
-      for z in six.iterkeys(inference.latent_vars):
-        z_copy = copy(z, dict_swap, scope=scope)
+    for x in six.iterkeys(inference.data):
+      if isinstance(x, RandomVariable):
+        x_copy = copy(x, dict_swap, scope=scope)
         p_log_prob[s] += tf.reduce_sum(
-            inference.scale.get(z, 1.0) * z_copy.log_prob(dict_swap[z]))
-
-      for x in six.iterkeys(inference.data):
-        if isinstance(x, RandomVariable):
-          x_copy = copy(x, dict_swap, scope=scope)
-          p_log_prob[s] += tf.reduce_sum(
-              inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
-    else:
-      x = inference.data
-      p_log_prob[s] = inference.model_wrapper.log_prob(x, z_sample)
+            inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
 
   p_log_prob = tf.stack(p_log_prob)
   q_log_prob = tf.stack(q_log_prob)
-
-  if var_list is None:
-    var_list = tf.trainable_variables()
 
   losses = p_log_prob - q_log_prob
   loss = -tf.reduce_mean(losses)
@@ -602,60 +553,44 @@ def build_score_kl_loss_and_gradients(inference, var_list):
 
   It assumes the KL is analytic.
 
-  For model wrappers, it assumes the prior is :math:`p(z) =
-  \mathcal{N}(z; 0, 1)`.
-
   Computed by sampling from :math:`q(z;\lambda)` and evaluating the
   expectation using Monte Carlo sampling.
   """
   p_log_lik = [0.0] * inference.n_samples
   q_log_prob = [0.0] * inference.n_samples
   for s in range(inference.n_samples):
+    # Form dictionary in order to replace conditioning on prior or
+    # observed variable with conditioning on a specific value.
     scope = 'inference_' + str(id(inference)) + '/' + str(s)
-    z_sample = {}
+    dict_swap = {}
+    for x, qx in six.iteritems(inference.data):
+      if isinstance(x, RandomVariable):
+        if isinstance(qx, RandomVariable):
+          qx_copy = copy(qx, scope=scope)
+          dict_swap[x] = qx_copy.value()
+        else:
+          dict_swap[x] = qx
+
     for z, qz in six.iteritems(inference.latent_vars):
       # Copy q(z) to obtain new set of posterior samples.
       qz_copy = copy(qz, scope=scope)
-      z_sample[z] = qz_copy.value()
+      dict_swap[z] = qz_copy.value()
       q_log_prob[s] += tf.reduce_sum(
           inference.scale.get(z, 1.0) *
-          qz_copy.log_prob(tf.stop_gradient(z_sample[z])))
+          qz_copy.log_prob(tf.stop_gradient(dict_swap[z])))
 
-    if inference.model_wrapper is None:
-      # Form dictionary in order to replace conditioning on prior or
-      # observed variable with conditioning on a specific value.
-      dict_swap = z_sample
-      for x, qx in six.iteritems(inference.data):
-        if isinstance(x, RandomVariable):
-          if isinstance(qx, RandomVariable):
-            qx_copy = copy(qx, scope=scope)
-            dict_swap[x] = qx_copy.value()
-          else:
-            dict_swap[x] = qx
-
-      for x in six.iterkeys(inference.data):
-        if isinstance(x, RandomVariable):
-          x_copy = copy(x, dict_swap, scope=scope)
-          p_log_lik[s] += tf.reduce_sum(
-              inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
-    else:
-      x = inference.data
-      p_log_lik[s] = inference.model_wrapper.log_lik(x, z_sample)
+    for x in six.iterkeys(inference.data):
+      if isinstance(x, RandomVariable):
+        x_copy = copy(x, dict_swap, scope=scope)
+        p_log_lik[s] += tf.reduce_sum(
+            inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
 
   p_log_lik = tf.stack(p_log_lik)
   q_log_prob = tf.stack(q_log_prob)
 
-  if inference.model_wrapper is None:
-    kl = tf.reduce_sum([
-        inference.kl_scaling.get(z, 1.0) * tf.reduce_sum(
-            kl_multivariate_normal(qz.mu, qz.sigma, z.mu, z.sigma))
-        for z, qz in six.iteritems(inference.latent_vars)])
-  else:
-    kl = tf.reduce_sum([tf.reduce_sum(kl_multivariate_normal(qz.mu, qz.sigma))
-                        for qz in six.itervalues(inference.latent_vars)])
-
-  if var_list is None:
-    var_list = tf.trainable_variables()
+  kl = tf.reduce_sum([
+      inference.kl_scaling.get(z, 1.0) * tf.reduce_sum(ds.kl(qz, z))
+      for z, qz in six.iteritems(inference.latent_vars)])
 
   loss = -(tf.reduce_mean(p_log_lik) - kl)
   grads = tf.gradients(
@@ -677,50 +612,42 @@ def build_score_entropy_loss_and_gradients(inference, var_list):
   p_log_prob = [0.0] * inference.n_samples
   q_log_prob = [0.0] * inference.n_samples
   for s in range(inference.n_samples):
+    # Form dictionary in order to replace conditioning on prior or
+    # observed variable with conditioning on a specific value.
     scope = 'inference_' + str(id(inference)) + '/' + str(s)
-    z_sample = {}
+    dict_swap = {}
+    for x, qx in six.iteritems(inference.data):
+      if isinstance(x, RandomVariable):
+        if isinstance(qx, RandomVariable):
+          qx_copy = copy(qx, scope=scope)
+          dict_swap[x] = qx_copy.value()
+        else:
+          dict_swap[x] = qx
+
     for z, qz in six.iteritems(inference.latent_vars):
       # Copy q(z) to obtain new set of posterior samples.
       qz_copy = copy(qz, scope=scope)
-      z_sample[z] = qz_copy.value()
+      dict_swap[z] = qz_copy.value()
       q_log_prob[s] += tf.reduce_sum(
           inference.scale.get(z, 1.0) *
-          qz_copy.log_prob(tf.stop_gradient(z_sample[z])))
+          qz_copy.log_prob(tf.stop_gradient(dict_swap[z])))
 
-    if inference.model_wrapper is None:
-      # Form dictionary in order to replace conditioning on prior or
-      # observed variable with conditioning on a specific value.
-      dict_swap = z_sample
-      for x, qx in six.iteritems(inference.data):
-        if isinstance(x, RandomVariable):
-          if isinstance(qx, RandomVariable):
-            qx_copy = copy(qx, scope=scope)
-            dict_swap[x] = qx_copy.value()
-          else:
-            dict_swap[x] = qx
+    for z in six.iterkeys(inference.latent_vars):
+      z_copy = copy(z, dict_swap, scope=scope)
+      p_log_prob[s] += tf.reduce_sum(
+          inference.scale.get(z, 1.0) * z_copy.log_prob(dict_swap[z]))
 
-      for z in six.iterkeys(inference.latent_vars):
-        z_copy = copy(z, dict_swap, scope=scope)
+    for x in six.iterkeys(inference.data):
+      if isinstance(x, RandomVariable):
+        x_copy = copy(x, dict_swap, scope=scope)
         p_log_prob[s] += tf.reduce_sum(
-            inference.scale.get(z, 1.0) * z_copy.log_prob(dict_swap[z]))
-
-      for x in six.iterkeys(inference.data):
-        if isinstance(x, RandomVariable):
-          x_copy = copy(x, dict_swap, scope=scope)
-          p_log_prob[s] += tf.reduce_sum(
-              inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
-    else:
-      x = inference.data
-      p_log_prob[s] = inference.model_wrapper.log_prob(x, z_sample)
+            inference.scale.get(x, 1.0) * x_copy.log_prob(dict_swap[x]))
 
   p_log_prob = tf.stack(p_log_prob)
   q_log_prob = tf.stack(q_log_prob)
 
-  q_entropy = tf.reduce_sum([inference.data.get(z, 1.0) * qz.entropy()
-                             for z, qz in six.iteritems(inference.latent_vars)])
-
-  if var_list is None:
-    var_list = tf.trainable_variables()
+  q_entropy = tf.reduce_sum([
+      qz.entropy() for z, qz in six.iteritems(inference.latent_vars)])
 
   loss = -(tf.reduce_mean(p_log_prob) + q_entropy)
   grads = tf.gradients(

@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """Dirichlet process.
 
-We sample from a Dirichlet process (with no base distribution) by
-using its stick breaking construction.
+We sample from a Dirichlet process (with no base distribution) via its
+stick breaking construction.
 
 References
 ----------
-https://probmods.org/non-parametric-models.html#infinite-discrete-distributions-the-dirichlet-processes
+https://probmods.org/chapters/12-non-parametric-models.html#infinite-discrete-distributions-the-dirichlet-processes
 """
 from __future__ import absolute_import
 from __future__ import division

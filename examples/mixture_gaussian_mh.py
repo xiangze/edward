@@ -6,6 +6,10 @@ because we are proposing a sample in a high-dimensional space. The
 acceptance ratio is so small that it is unlikely we'll ever accept a
 proposed sample. A Gibbs-like extension ("MH within Gibbs"), which
 does a separate MH in each dimension, may succeed.
+
+References
+----------
+http://edwardlib.org/tutorials/unsupervised
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -46,7 +50,7 @@ pi = Dirichlet(alpha=tf.constant([1.0] * K))
 mu = Normal(mu=tf.zeros([K, D]), sigma=tf.ones([K, D]))
 sigma = InverseGamma(alpha=tf.ones([K, D]), beta=tf.ones([K, D]))
 c = Categorical(logits=tf.tile(tf.reshape(ed.logit(pi), [1, K]), [N, 1]))
-x = Normal(mu=tf.gather(mu, c), sigma=tf.gather(sigma, c))
+x = Normal(mu=mu[c], sigma=sigma[c])
 
 # INFERENCE
 T = 5000

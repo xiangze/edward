@@ -4,6 +4,9 @@ from __future__ import print_function
 
 import tensorflow as tf
 
+from tensorflow.python.client.session import \
+    register_session_run_conversion_functions
+
 RANDOM_VARIABLE_COLLECTION = "_random_variable_collection_"
 
 
@@ -77,16 +80,25 @@ class RandomVariable(object):
       else:
         self._value = t_value
     else:
-      self._value = self.sample()
+      try:
+        self._value = self.sample()
+      except:
+        raise NotImplementedError(
+            "sample is not implemented for {0}. You must either pass in the "
+            "value argument or implement sample for {0}."
+            .format(self.__class__.__name__))
 
   def __str__(self):
-    return '<ed.RandomVariable \'' + self.name.__str__() + '\' ' + \
-           'shape=' + self._value.get_shape().__str__() + ' ' \
-           'dtype=' + self.dtype.__repr__() + \
-           '>'
+    return "RandomVariable(\"%s\"%s%s%s)" % (
+        self.name,
+        (", shape=%s" % self.get_shape())
+        if self.get_shape().ndims is not None else "",
+        (", dtype=%s" % self.dtype.name) if self.dtype else "",
+        (", device=%s" % self.value().device) if self.value().device else "")
 
   def __repr__(self):
-    return self.__str__()
+    return "<ed.RandomVariable '%s' shape=%s dtype=%s>" % (
+        self.name, self.get_shape(), self.dtype.name)
 
   def __add__(self, other):
     return tf.add(self, other)
@@ -158,6 +170,11 @@ class RandomVariable(object):
   def __rxor__(self, other):
     return tf.logical_xor(other, self)
 
+  def __getitem__(self, key):
+    """Subset the tensor associated to the random variable, not the
+    random variable itself."""
+    return self.value()[key]
+
   def __pow__(self, other):
     return tf.pow(self, other)
 
@@ -178,6 +195,55 @@ class RandomVariable(object):
 
   def __eq__(self, other):
     return id(self) == id(other)
+
+  def __iter__(self):
+    raise TypeError("'RandomVariable' object is not iterable.")
+
+  def __bool__(self):
+    raise TypeError(
+        "Using a `ed.RandomVariable` as a Python `bool` is not allowed. "
+        "Use `if t is not None:` instead of `if t:` to test if a "
+        "random variable is defined, and use TensorFlow ops such as "
+        "tf.cond to execute subgraphs conditioned on a draw from "
+        "a random variable.")
+
+  def __nonzero__(self):
+    raise TypeError(
+        "Using a `ed.RandomVariable` as a Python `bool` is not allowed. "
+        "Use `if t is not None:` instead of `if t:` to test if a "
+        "random variable is defined, and use TensorFlow ops such as "
+        "tf.cond to execute subgraphs conditioned on a draw from "
+        "a random variable.")
+
+  def eval(self, session=None, feed_dict=None):
+    """In a session, computes and returns the value of this random variable.
+
+    This is not a graph construction method, it does not add ops to the graph.
+
+    This convenience method requires a session where the graph
+    containing this variable has been launched. If no session is
+    passed, the default session is used.
+
+    Parameters
+    ----------
+    session : tf.BaseSession, optional
+      The ``tf.Session`` to use to evaluate this random variable. If
+      none, the default session is used.
+    feed_dict : dict, optional
+      A dictionary that maps `Tensor` objects to feed values. See
+      ``tf.Session.run()`` for a description of the valid feed values.
+
+    Examples
+    --------
+    >>> x = Normal(0.0, 1.0)
+    >>> with tf.Session() as sess:
+    >>>   # Usage passing the session explicitly.
+    >>>   print(x.eval(sess))
+    >>>   # Usage with the default session.  The 'with' block
+    >>>   # above makes 'sess' the default session.
+    >>>   print(x.eval())
+    """
+    return self.value().eval(session=session, feed_dict=feed_dict)
 
   def value(self):
     """Get tensor that the random variable corresponds to."""
@@ -217,6 +283,15 @@ class RandomVariable(object):
     """Get shape of random variable."""
     return self._value.get_shape()
 
+  def _session_run_conversion_fetch_function(tensor):
+    return ([tensor.value()], lambda val: val[0])
+
+  def _session_run_conversion_feed_function(feed, feed_val):
+    return [(feed.value(), feed_val)]
+
+  def _session_run_conversion_feed_function_for_partial_run(feed):
+    return [feed.value()]
+
   def _tensor_conversion_function(v, dtype=None, name=None, as_ref=False):
     _ = name
     if dtype and not dtype.is_compatible_with(v.dtype):
@@ -227,6 +302,12 @@ class RandomVariable(object):
       raise ValueError("%s: Ref type is not supported." % v)
     return v.value()
 
+
+register_session_run_conversion_functions(
+    RandomVariable,
+    RandomVariable._session_run_conversion_fetch_function,
+    RandomVariable._session_run_conversion_feed_function,
+    RandomVariable._session_run_conversion_feed_function_for_partial_run)
 
 tf.register_tensor_conversion_function(
     RandomVariable, RandomVariable._tensor_conversion_function)

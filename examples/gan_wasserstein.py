@@ -2,6 +2,10 @@
 """Wasserstein generative adversarial network for MNIST (Arjovsky et
 al., 2017). It modifies GANs (Goodfellow et al., 2014) to optimize
 under the Wasserstein distance.
+
+References
+----------
+http://edwardlib.org/tutorials/gan
 """
 from __future__ import absolute_import
 from __future__ import print_function
@@ -19,8 +23,8 @@ from tensorflow.contrib import slim
 from tensorflow.examples.tutorials.mnist import input_data
 
 
-def generative_network(z):
-  h1 = slim.fully_connected(z, 128, activation_fn=tf.nn.relu)
+def generative_network(eps):
+  h1 = slim.fully_connected(eps, 128, activation_fn=tf.nn.relu)
   x = slim.fully_connected(h1, 784, activation_fn=tf.sigmoid)
   return x
 
@@ -66,8 +70,8 @@ x_ph = tf.placeholder(tf.float32, [M, 784])
 
 # MODEL
 with tf.variable_scope("Gen"):
-  z = Uniform(a=tf.zeros([M, d]) - 1.0, b=tf.ones([M, d]))
-  x = generative_network(z)
+  eps = Uniform(a=tf.zeros([M, d]) - 1.0, b=tf.ones([M, d]))
+  x = generative_network(eps)
 
 # INFERENCE
 optimizer = tf.train.RMSPropOptimizer(learning_rate=5e-5)
@@ -76,7 +80,7 @@ optimizer_d = tf.train.RMSPropOptimizer(learning_rate=5e-5)
 inference = ed.WGANInference(
     data={x: x_ph}, discriminator=discriminative_network)
 inference.initialize(
-    optimizer=optimizer, optimizer_d=optimizer,
+    optimizer=optimizer, optimizer_d=optimizer_d,
     n_iter=15000, n_print=1000)
 
 sess = ed.get_session()

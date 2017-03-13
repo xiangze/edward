@@ -57,7 +57,7 @@ qz = Empirical(params=tf.Variable(tf.random_normal([T, N, d])))
 inference_e = ed.HMC({z: qz}, data={x: x_train})
 inference_e.initialize()
 
-inference_m = ed.MAP(data={x: x_train, z: tf.gather(qz.params, inference_e.t)})
+inference_m = ed.MAP(data={x: x_train, z: qz.params[inference_e.t]})
 optimizer = tf.train.AdamOptimizer(0.01, epsilon=1.0)
 inference_m.initialize(optimizer=optimizer)
 
@@ -88,6 +88,6 @@ for epoch in range(n_epoch):
   print("log p(x) >= {:0.3f}".format(avg_loss))
 
   # Prior predictive check.
-  imgs = x.value().eval()
+  imgs = x.eval()
   for m in range(N):
     imsave(os.path.join(IMG_DIR, '%d.png') % m, imgs[m].reshape(28, 28))

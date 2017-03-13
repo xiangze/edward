@@ -7,7 +7,7 @@ import tensorflow as tf
 
 from edward.inferences.variational_inference import VariationalInference
 from edward.models import RandomVariable, Normal
-from edward.util import copy, log_sum_exp
+from edward.util import copy
 
 
 class KLpq(VariationalInference):
@@ -97,48 +97,40 @@ class KLpq(VariationalInference):
     p_log_prob = [0.0] * self.n_samples
     q_log_prob = [0.0] * self.n_samples
     for s in range(self.n_samples):
+      # Form dictionary in order to replace conditioning on prior or
+      # observed variable with conditioning on a specific value.
       scope = 'inference_' + str(id(self)) + '/' + str(s)
-      z_sample = {}
+      dict_swap = {}
+      for x, qx in six.iteritems(self.data):
+        if isinstance(x, RandomVariable):
+          if isinstance(qx, RandomVariable):
+            qx_copy = copy(qx, scope=scope)
+            dict_swap[x] = qx_copy.value()
+          else:
+            dict_swap[x] = qx
+
       for z, qz in six.iteritems(self.latent_vars):
         # Copy q(z) to obtain new set of posterior samples.
         qz_copy = copy(qz, scope=scope)
-        z_sample[z] = qz_copy.value()
+        dict_swap[z] = qz_copy.value()
         q_log_prob[s] += tf.reduce_sum(
-            qz_copy.log_prob(tf.stop_gradient(z_sample[z])))
+            qz_copy.log_prob(tf.stop_gradient(dict_swap[z])))
 
-      if self.model_wrapper is None:
-        # Form dictionary in order to replace conditioning on prior or
-        # observed variable with conditioning on a specific value.
-        dict_swap = z_sample
-        for x, qx in six.iteritems(self.data):
-          if isinstance(x, RandomVariable):
-            if isinstance(qx, RandomVariable):
-              qx_copy = copy(qx, scope=scope)
-              dict_swap[x] = qx_copy.value()
-            else:
-              dict_swap[x] = qx
+      for z in six.iterkeys(self.latent_vars):
+        z_copy = copy(z, dict_swap, scope=scope)
+        p_log_prob[s] += tf.reduce_sum(z_copy.log_prob(dict_swap[z]))
 
-        for z in six.iterkeys(self.latent_vars):
-          z_copy = copy(z, dict_swap, scope=scope)
-          p_log_prob[s] += tf.reduce_sum(z_copy.log_prob(dict_swap[z]))
-
-        for x in six.iterkeys(self.data):
-          if isinstance(x, RandomVariable):
-            x_copy = copy(x, dict_swap, scope=scope)
-            p_log_prob[s] += tf.reduce_sum(x_copy.log_prob(dict_swap[x]))
-      else:
-        x = self.data
-        p_log_prob[s] = self.model_wrapper.log_prob(x, z_sample)
+      for x in six.iterkeys(self.data):
+        if isinstance(x, RandomVariable):
+          x_copy = copy(x, dict_swap, scope=scope)
+          p_log_prob[s] += tf.reduce_sum(x_copy.log_prob(dict_swap[x]))
 
     p_log_prob = tf.stack(p_log_prob)
     q_log_prob = tf.stack(q_log_prob)
 
     log_w = p_log_prob - q_log_prob
-    log_w_norm = log_w - log_sum_exp(log_w)
+    log_w_norm = log_w - tf.reduce_logsumexp(log_w)
     w_norm = tf.exp(log_w_norm)
-
-    if var_list is None:
-      var_list = tf.trainable_variables()
 
     loss = tf.reduce_mean(w_norm * log_w)
     grads = tf.gradients(
